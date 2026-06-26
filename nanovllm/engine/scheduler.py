@@ -155,6 +155,7 @@ class Scheduler:
         num_batched_tokens 累计已经放入该 batch 的 token 数。
         remaining 就是还能往 batch 里追加的 token 数。如果 remaining == 0，预算花光，直接结束调度。
         num_tokens 就是本轮还需处理的 token 数（从断点继续）。
+        chunked prefill 不是在“缩小 batch”，而是在 用多个 step 分摊处理一个超长 sequence，而 batch 只是每一步的 token 预算约束。
         """
         scheduled_seqs = []
         num_batched_tokens = 0
@@ -166,6 +167,11 @@ class Scheduler:
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
             remaining = self.max_num_batched_tokens - num_batched_tokens
+            ## 在有prefill请求的时候，且len(scheduled_seqs) < self.max_num_seqs: 即当前可以调度的情况下。
+            ## 调度第二个需求，就减去第一个请求的调度的tokens，这个默认是逐请求调度的，如果请求过长，还会chunked prefill
+            ## chunked prefill的逻辑是 seq.num_scheduled_tokens = min(num_tokens, remaining)
+            ## 如果当前剩余的能够完全调度，那就是num_tokens，否则只调度remaining的，即chunked prefill
+            ## 如果某个请求达到了完整的长度，就会加入running队列中
             if remaining == 0:
                 break
 
@@ -176,10 +182,10 @@ class Scheduler:
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
-                # 分块 prefill 续处理：block_table 已在上一轮分配，从断点继续
+                # 分块 prefill 续处理：block_table 已在上一轮分配，从断点继续，分块的prefill，会写kv cache
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
 
-            # 分块限制：只有本轮第一个 seq 允许切分，否则遇到预算不够就 break
+            # 分块限制：只有本轮第一个 seq 允许切分，否则遇到预算不够就 break，如果剩下可以调度的没法完全调度剩余的token，并且已经调度了token了，就break
             if remaining < num_tokens and scheduled_seqs:
                 break
             '''
@@ -193,13 +199,14 @@ class Scheduler:
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
 
-            seq.num_scheduled_tokens = min(num_tokens, remaining)
+            seq.num_scheduled_tokens = min(num_tokens, remaining) # 如果prompt 特别大，max_num_batched_tokens比较小，这里最多调度remaining的
             # 如果是第一个序列，那么会分块，后续的序列都不会被chunked
             # 如果是chunked的序列，这里调度的应该是remaining
             # 取 num_tokens（真正需要的）和 remaining（预算允许的）的最小值，避免超预算。
             num_batched_tokens += seq.num_scheduled_tokens
 
-            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+            if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens: # 达到序列长度就break
+                # 正常情况下，如果序列长度比较短的话，这个if会进去
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
@@ -225,7 +232,7 @@ class Scheduler:
             else:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                self.block_manager.may_append(seq) # Decode 阶段，如果当前 block 已满，追加一个新 block。
                 scheduled_seqs.append(seq)
 
         assert scheduled_seqs, (
@@ -236,7 +243,27 @@ class Scheduler:
         # 逆序放回：[A,B,C] → extendleft([C,B,A]) → 下轮 popleft 先取 C
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
-
+        # extendleft(reversed(seqs)) 的本质：
+        # 把本轮调度的序列按“反序插入队头”，
+        # 实现下一轮的轮转公平（round-robin fairness），避免队首长期垄断执行权。
+        # 6️⃣ 更直觉的解释（非常关键）
+        #
+        # 如果不 reverse：
+        #
+        # 本轮：[A B C]
+        # 下一轮执行顺序：[A B C]
+        #
+        # → A 会“连续被优先执行”
+        #
+        # 现在 reverse：
+        #
+        # 本轮：[A B C]
+        # 下一轮执行顺序：[C B A]
+        #
+        # → 相当于：
+        #
+        # 每轮“翻转执行优先级”
+        # 避免固定 head 永远占优
     # ==================== 抢占 ====================
 
     def preempt(self, seq: Sequence):
@@ -311,7 +338,7 @@ class Scheduler:
             # --- 步骤 2: 推进缓存进度 ---
             # num_cached_tokens 记录了"KV 已写入 block 且 hash 已注册"的 token 数。
             # 每次 postprocess 后推进这个指针，下次 schedule 时以此为起点。
-            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_cached_tokens += seq.num_scheduled_tokens # 计算完kv cache之后，就要写入，num_cached_tokens就会增加
             seq.num_scheduled_tokens = 0     # 重置，本步结束
 
             # --- 步骤 3: 分块 prefill 中途 → 跳过 append ---
@@ -327,6 +354,7 @@ class Scheduler:
             seq.append_token(token_id)
 
             # --- 步骤 5: 检查终止条件 ---
+            ## 不断的decode，因为running队列始终不空，就会一直decode，直到达到最大的序列长度或者是有eos请求。
             stop_by_eos = (not seq.ignore_eos and token_id == self.eos)
             stop_by_len = (seq.num_completion_tokens == seq.max_tokens)
 

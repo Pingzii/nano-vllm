@@ -28,6 +28,8 @@ class ModelRunner:
     5. CUDA Graph: 捕获 decode 阶段的计算图，减少 kernel launch overhead
 
     TP 通信机制 (SharedMemory):
+    ❗这里的 shared memory 不是 GPU SM 里的 shared memory（SRAM）
+    ❗而是 CPU 侧的进程间共享内存（POSIX Shared Memory）
         ┌─────────┐  write_shm()   ┌───────────────┐  Event.set()  ┌─────────┐
         │ Rank 0  │ ──────────────→ │ Shared Memory │ ─────────────→│ Rank 1  │
         │ (main)  │                 │  (pickle)     │               │ (worker)│
@@ -308,8 +310,9 @@ class ModelRunner:
             seqlen_k = end                                   # key 序列长度 = 缓存 + 新 token
 
             # 收集 token_ids 和 positions
-            input_ids.extend(seq[start:end])                #
-            positions.extend(range(start, end))
+            ## 这里是用了chunked prefill，所以不是所有的tokens都被统计
+            input_ids.extend(seq[start:end])                # input_ids 就是某个序列，需要计算的tokens从缓存开始，到调度的最后结果的token值
+            positions.extend(range(start, end))             # position 就是某个序列，需要计算的tokens从缓存开始，到调度的最后结果的index
 
             # 累积序列长度
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -326,16 +329,25 @@ class ModelRunner:
             for i in range(start_block, end_block):
                 slot_start = seq.block_table[i] * self.block_size
                 if i == start_block:
-                    slot_start += start % self.block_size    # 第一个 block 可能有偏移
+                    slot_start += start % self.block_size
+                    # 第一个 block 可能有偏移，所以slot start需要修改一下，
+                    # 主要可能是之前的请求的完成的kv cache
                 if i != end_block - 1:
                     slot_end = seq.block_table[i] * self.block_size + self.block_size
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
+                    ## end - i * block_size: token 在“逻辑 block i”里的 offset，转化到物理block上，太妙了
+                slot_mapping.extend(range(slot_start, slot_end)) # slot mapping 建立了 block table上逻辑块的所有token 在物理块的index range
+                # slot_mapping 将每个 logical block 内的 token 展开，并映射到对应 physical KV cache slot 的连续地址区间
+                # mapping: logical slot index -> physical slot index for every seq
 
-        # 有 prefix cache 命中 → 需要 block_tables 从 cache 读 K/V
+        # 有 prefix cache 命中 → 需要 block_tables 从 cache 读 K/V，❗ “key 比 query 长 → 有一部分 key 来自缓存”
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
+            # 将各序列不等长的 block_table 对齐为 GPU tensor。
+            # cu_seqlens_k > cu_seqlens_q
+            # ⇔
+            # ∃ seq: num_cached_tokens > 0
 
         # CPU pin_memory → GPU 异步传输
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
